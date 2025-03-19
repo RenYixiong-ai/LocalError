@@ -7,6 +7,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 import numpy as np
+import wandb
 
 
 # 定义数据加载函数
@@ -37,7 +38,7 @@ class SingleLayerNetwork(nn.Module):
 
     def forward(self, x):
         x = self.fc(x)
-        x = self.relu(x)
+        x = (torch.tanh(x)+1)/2.0
         return x
 
 # 定义模型
@@ -201,10 +202,21 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     trainloader, testloader = get_data()
 
+    wandb.init(
+    # set the wandb project where this run will be logged
+    project="FBM",
+    name="LocalError",
+    config={
+        "dataset": "MNIST",
+        "layers": 5,
+        "epoch": "20",
+        }
+    )
+
     tot_NN = MultiLayerNetwork()
     input_size = 28*28
-    size_range = [1000, 1000, 1000, 1000, 1000]
-    for k, output_size in enumerate(size_range):
+    size_range = [1000, 1000, 1000, 1000, 1000, 1000]
+    for num_layer, output_size in enumerate(size_range):
         # 初始化一个单层网络
         Single_NN = SingleLayerNetwork(input_size, output_size).to(device)
         optimizer = optim.Adam(Single_NN.parameters(), lr=0.001)
@@ -212,13 +224,13 @@ if __name__ == "__main__":
         readout_head = ReadoutHead(output_size, 10).to(device)
 
         # 训练该单层网络
-        for epoch in range(15):
+        for epoch in range(20):
             Single_NN.train()  # 设为训练模式，启用 Dropout、BatchNorm
             loss = train_with_readout(fixed_network=tot_NN, target_network=Single_NN, readout_head=readout_head, data_loader=trainloader, optimizer=optimizer, criterion=criterion, device=device)
 
             # 分析网络的特征
             tot_NN.add(Single_NN)
-            eva_value = evaluate_accuracy(target_network=tot_NN, readout_head=readout_head, data_loader=testloader, device=device)
+            accuracy = evaluate_accuracy(target_network=tot_NN, readout_head=readout_head, data_loader=testloader, device=device)
 
             tot_NN.eval()  # 设为评估模式，不启用 Dropout、BatchNorm
             output_list = []
@@ -226,23 +238,37 @@ if __name__ == "__main__":
                 for inputs, labels in trainloader:
                     inputs = inputs.view(inputs.shape[0], -1)  # 将图像展平
                     inputs, labels = inputs.to(device), labels.to(device)
-                    output = tot_NN(inputs, 3)  # 前向传播
+                    output = tot_NN(inputs)  # 前向传播
                     output_list.append(output.cpu().numpy())  # 转换为 NumPy 并保存
 
             # 拼接成一个完整的 NumPy 数组
             final_output = np.vstack(output_list) 
             eigenvalues = get_eigenvalues(final_output)
-            slope, R2_95, k = get_alpha_r(eigenvalues)
+            slope, R2_10, k = get_alpha_r(eigenvalues)
             tot_NN.pop()
 
-            print("each epoch", loss, eva_value, slope, R2_95, k)
+            print("each epoch", loss, accuracy, slope, R2_10, k)
+            wandb.log({f"layer{num_layer}_epoch":epoch, 
+                       f"layer{num_layer}_Loss": loss, 
+                       f"layer{num_layer}_accuracy":accuracy, 
+                       f"layer{num_layer}_slope": slope, 
+                       f"layer{num_layer}_R2_10": R2_10,
+                       f"layer{num_layer}_k_95": k}) 
 
+        wandb.log({f"layer":num_layer, 
+                    f"Loss": loss, 
+                    f"accuracy":accuracy, 
+                    f"slope": slope, 
+                    f"R2_10": R2_10,
+                    f"k_95": k})
+        
         input_size = output_size
         tot_NN.add(Single_NN)
 
         eva_value = evaluate_accuracy(target_network=tot_NN, readout_head=readout_head, data_loader=testloader, device=device)
         print("eval", eva_value)
 
+    wandb.finish()
     tot_NN.add(readout_head)
 
     final_eval = evaluate_accuracy(target_network=tot_NN, data_loader=testloader, device=device)
